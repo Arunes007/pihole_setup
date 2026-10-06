@@ -1098,9 +1098,29 @@ sudo apt install -y qrencode
 | YouTube app still shows ads | Fundamental DNS limit, not a bug | SmartTube / ReVanced / uBlock / Premium (§3) |
 | Site blocks you / demands captcha | It dislikes datacenter (VPS) IPs | DNS-only profile or per-app exclusion (§11.6) |
 | Rules/peers gone after reboot | Only applied live, never persisted | Peers → `wg0.conf`; iptables → `PostUp` (§11.2, §12.3) |
+| All DNS fails, tunnel connected, `unbound` failed | `root.key` corrupted (often by apt upgrade stopping Unbound mid-write) | `sudo rm -f /var/lib/unbound/root.key && sudo systemctl restart unbound` (§17.1) |
 | Web UI login loops / 404 | Wrong URL (missing `:8888` or trailing path) | Exact URL §15.1; `curl -v` to see redirect chain |
 
 ---
+
+## 17.1 Incident: Unbound root.key corruption (2026-10-06)
+
+**Symptom:** All DNS resolution fails. Tunnel connects, Pi-hole is active, but `dig @127.0.0.1` times out. `systemctl status unbound` shows `failed`.
+
+**Root cause:** `unattended-upgrades` upgraded `unbound` from `1.24.2-1ubuntu2.2` to `1.24.2-1ubuntu2.3` at 06:12:44. The upgrade cleanly stopped the service — but Unbound was mid-write of `/var/lib/unbound/root.key` (RFC 5011 trust anchor update). The half-written file contained a duplicate trust anchor entry (`trust anchor for . presented twice` at line 2), causing Unbound to crash-loop on restart.
+
+**Fix applied:**
+```bash
+sudo rm -f /var/lib/unbound/root.key
+sudo systemctl restart unbound
+```
+Unbound regenerated the trust anchor on startup and resumed normal operation.
+
+**Prevention (both applied):**
+1. **Blacklisted unbound from unattended-upgrades** — added `"unbound";` to `/etc/apt/apt.conf.d/50unattended-upgrades` `Package-Blacklist`. Unbound will no longer be auto-upgraded; upgrade it manually when needed.
+2. **Health-check cron job** — `/usr/local/bin/unbound-healthcheck.sh` runs every 5 minutes. If Unbound is down, it checks `unbound-checkconf`; if the config is corrupt (e.g. bad root.key), it removes the file and restarts. Logs to syslog with tag `unbound-healthcheck`.
+
+**Lesson:** Any service that maintains a state file with periodic rewrites (Unbounds root.key, Pi-holes gravity.db, etc.) is vulnerable to being stopped mid-write by package upgrades. Blacklisting critical DNS infrastructure from unattended-upgrades is the safest policy for a personal VPS.
 
 ## 18. Credentials and file inventory
 
