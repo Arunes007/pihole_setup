@@ -1098,7 +1098,7 @@ sudo apt install -y qrencode
 | YouTube app still shows ads | Fundamental DNS limit, not a bug | SmartTube / ReVanced / uBlock / Premium (§3) |
 | Site blocks you / demands captcha | It dislikes datacenter (VPS) IPs | DNS-only profile or per-app exclusion (§11.6) |
 | Rules/peers gone after reboot | Only applied live, never persisted | Peers → `wg0.conf`; iptables → `PostUp` (§11.2, §12.3) |
-| All DNS fails, tunnel connected, `unbound` failed | `root.key` corrupted (often by apt upgrade stopping Unbound mid-write) | `sudo rm -f /var/lib/unbound/root.key && sudo systemctl restart unbound` (§17.1) |
+| All DNS fails, tunnel connected, `unbound` failed | `auto-trust-anchor-file` declared **twice** → doubled `root.key` → crash-loop (see §17.2) | `sudo sed -i '/auto-trust-anchor-file/d' /etc/unbound/unbound.conf.d/pi-hole.conf`, then `sudo rm -f /var/lib/unbound/root.key && sudo systemctl reset-failed unbound && sudo systemctl restart unbound` (§17.2) |
 | Web UI login loops / 404 | Wrong URL (missing `:8888` or trailing path) | Exact URL §15.1; `curl -v` to see redirect chain |
 
 ---
@@ -1121,6 +1121,61 @@ Unbound regenerated the trust anchor on startup and resumed normal operation.
 2. **Health-check cron job** — `/usr/local/bin/unbound-healthcheck.sh` runs every 5 minutes. If Unbound is down, it checks `unbound-checkconf`; if the config is corrupt (e.g. bad root.key), it removes the file and restarts. Logs to syslog with tag `unbound-healthcheck`.
 
 **Lesson:** Any service that maintains a state file with periodic rewrites (Unbounds root.key, Pi-holes gravity.db, etc.) is vulnerable to being stopped mid-write by package upgrades. Blacklisting critical DNS infrastructure from unattended-upgrades is the safest policy for a personal VPS.
+
+> **Correction (2026-10-24):** The "stopped mid-write by an upgrade" theory above was **incomplete**. The upgrade was a trigger, not the root cause. The file was being doubled on *every* anchor rewrite because `auto-trust-anchor-file` was declared twice in config (see §17.2). The real fix is the config de-duplication, not the upgrade blacklist.
+
+---
+
+## 17.2 Incident: Unbound root.key corruption, recurrence + true root cause (2026-10-24)
+
+**Symptom:** Identical to §17.1 — all DNS fails, tunnel connects, Pi-hole `active`, `unbound` `failed`. No package upgrade had occurred (the §17.1 blacklist held). `unbound-checkconf` reported:
+```
+error: trust anchor for '.' presented twice
+error: could not parse auto-trust-anchor-file /var/lib/unbound/root.key line 2
+```
+
+**Why the §17.1 prevention did not stop it:** The 5-minute health-check cron had been installed in the **user `ubuntu` crontab**, but its recovery actions (`rm /var/lib/unbound/root.key`, `systemctl restart unbound`) require **root**. Running as `ubuntu` it logged its intent every 5 minutes and then silently failed — the service stayed down ~1.5 h. It had the right logic but not the privileges.
+
+**True root cause:** `auto-trust-anchor-file: "/var/lib/unbound/root.key"` was declared in **two** config fragments:
+- `/etc/unbound/unbound.conf.d/pi-hole.conf` (added during setup)
+- `/etc/unbound/unbound.conf.d/root-auto-trust-anchor-file.conf` (Ubuntu package default — same path)
+
+With the anchor registered twice, Unbound wrote each DNSKEY into `root.key` twice (one `VALID` + one duplicate `MISSING` twin — 4 DNSKEY lines instead of 2). On the next restart, reading that doubled file raised "presented twice" and the daemon crash-looped. This explains why the file "kept corrupting" despite no upgrades: any restart regenerated the doubled file.
+
+**Fix applied (real fix):**
+```bash
+# 1. Remove the duplicate declaration (keep the package default fragment)
+sudo sed -i '/auto-trust-anchor-file/d' /etc/unbound/unbound.conf.d/pi-hole.conf
+
+# 2. Recreate a clean anchor file and restart
+sudo rm -f /var/lib/unbound/root.key
+sudo systemctl reset-failed unbound
+sudo systemctl restart unbound
+
+# 3. Verify — must print "no errors"
+sudo unbound-checkconf
+```
+`root.key` is now structurally clean (2 DNSKEYs, 0 duplicates) and `unbound-checkconf` is silent. Because the anchor is no longer double-registered, the doubling cannot regenerate — the recurrence loop is closed at the source.
+
+**Prevention (both applied this time):**
+1. **Health-check moved to root's crontab** (`sudo crontab -e`) and removed from the user crontab, so its `rm`/`restart` actions actually have privilege.
+2. **Health-check hardened** with `systemctl reset-failed unbound` before the restart — without it, systemd's "start request repeated too quickly" lock (which this incident hit) makes a bare `restart` a no-op.
+
+Current `/usr/local/bin/unbound-healthcheck.sh`:
+```bash
+#!/bin/bash
+if ! systemctl is-active --quiet unbound; then
+    logger -t unbound-healthcheck "Unbound down — checking root.key"
+    if ! unbound-checkconf >/dev/null 2>&1; then
+        logger -t unbound-healthcheck "root.key corrupt — removing and restarting"
+        rm -f /var/lib/unbound/root.key
+    fi
+    systemctl reset-failed unbound
+    systemctl restart unbound
+fi
+```
+
+**Lesson:** When a config value can be set in multiple fragments, `unbound-checkconf` only catches the *symptom* at the file level ("presented twice"); the *cause* was two `include`-d fragments declaring the same directive. On Debian/Ubuntu, always check the package's own `unbound.conf.d/*.conf` before adding a directive that the package already ships. Also: a cron job that needs root belongs in root's crontab — a user crontab that "runs fine" but silently can't act is worse than no cron job, because it creates false confidence.
 
 ## 18. Credentials and file inventory
 
